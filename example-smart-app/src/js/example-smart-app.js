@@ -1,26 +1,22 @@
 /* global FHIR, $, window */
 (function (window) {
-  /**
-   *  MAIN ENTRY ────────────────
-   *  Returns a jQuery-style promise that resolves with a
-   *  “patient summary” object ready for drawVisualization().
-   */
+  // ──────────────────────────────────────────────────────────────
+  //  MAIN ENTRY – returns a Promise resolved with a patient “view-model”
+  // ──────────────────────────────────────────────────────────────
   window.extractData = function () {
     const dfd = $.Deferred();
 
-    function onError() {
-      console.error('Loading error', arguments);
-      dfd.reject();
-    }
-
+    //------------------------------------------------------------------
+    // 1)  OAuth ready callback
+    //------------------------------------------------------------------
     function onReady(smart) {
       if (!smart.patient) {
-        return onError();
+        return fail('SMART object has no patient');
       }
 
-      // ── 1) fetch Patient + Observations in parallel ─────────────
-      const ptPromise  = smart.patient.read();
-      const obsPromise = smart.patient.api.fetchAll({
+      // Fetch Patient + Observations in parallel
+      const patientReq = smart.patient.read();
+      const obsReq     = smart.patient.api.fetchAll({
         type: 'Observation',
         query: {
           code: {
@@ -30,91 +26,99 @@
               'http://loinc.org|8480-6', // Systolic BP
               'http://loinc.org|2085-9', // HDL
               'http://loinc.org|2089-1', // LDL
-              'http://loinc.org|55284-4' // BP panel
+              'http://loinc.org|55284-4' // Blood-pressure panel
             ]
           }
         }
       });
 
-      $.when(ptPromise, obsPromise).fail(onError);
-
-      $.when(ptPromise, obsPromise).done(function (patient, observations) {
-        //------------------------------------------------------------------
-        // 2)  DEMOGRAPHICS
-        //------------------------------------------------------------------
-        const nameObj = (patient.name && patient.name.length) ? patient.name[0] : {};
-        const given   = Array.isArray(nameObj.given)  ? nameObj.given.join(' ')   : (nameObj.given   || '');
-        const family  = Array.isArray(nameObj.family) ? nameObj.family.join(' ')  : (nameObj.family  || '');
-
-        //------------------------------------------------------------------
-        // 3)  CLINICAL OBSERVATIONS
-        //------------------------------------------------------------------
-        const byCode      = smart.byCodes(observations, 'code');
-        const heightObs   = byCode('8302-2');
-        const bpPanel     = byCode('55284-4');
-        const systolicBP  = pickBP(bpPanel, '8480-6');
-        const diastolicBP = pickBP(bpPanel, '8462-4');
-        const hdlObs      = byCode('2085-9');
-        const ldlObs      = byCode('2089-1');
-
-        //------------------------------------------------------------------
-        // 4)  BUILD SUMMARY OBJECT
-        //------------------------------------------------------------------
-        const summary = {
-          fname:       given,
-          lname:       family,
-          gender:      patient.gender || '',
-          birthdate:   patient.birthDate || '',
-          height:      quantity(heightObs[0]),
-          systolicbp:  systolicBP,
-          diastolicbp: diastolicBP,
-          hdl:         quantity(hdlObs[0]),
-          ldl:         quantity(ldlObs[0])
-        };
-
-        dfd.resolve(summary);
-      });
+      $.when(patientReq, obsReq)
+        .fail((...args) => fail('FHIR read error', args))
+        .done((patient, observations) => dfd.resolve(buildSummary(patient, observations, smart)));
     }
 
-    FHIR.oauth2.ready(onReady, onError);
+    FHIR.oauth2.ready(onReady, (...args) => fail('OAuth ready error', args));
     return dfd.promise();
+
+    // --- helpers within extractData scope ---
+    function fail(msg, args) {
+      console.error(msg, args);
+      dfd.reject(msg);
+    }
   };
 
-  // ────────────────────────────────────────────────────────────────────
-  //  HELPERS
-  // ────────────────────────────────────────────────────────────────────
-  function pickBP(panel, loincCode) {
-    if (!panel || !panel.length) return undefined;
+  // ──────────────────────────────────────────────────────────────
+  //  BUILD SUMMARY OBJECT
+  // ──────────────────────────────────────────────────────────────
+  function buildSummary(patient, observations, smart) {
+    //  Demographics ─────────────────────────────────────────────
+    const name      = Array.isArray(patient.name) && patient.name.length ? patient.name[0] : {};
+    const given     = Array.isArray(name.given)  ? name.given.join(' ')  : (name.given  || '');
+    const family    = Array.isArray(name.family) ? name.family.join(' ') : (name.family || '');
 
-    // Find the component that matches the desired systolic/diastolic code
-    const match = panel.find(obs => {
-      const comp = (obs.component || []).find(c =>
-        (c.code?.coding || []).some(cd => cd.code === loincCode)
-      );
-      if (comp) {
-        // mutate so quantity() can reuse the same util
-        obs.valueQuantity = comp.valueQuantity;
-        return true;
-      }
-      return false;
-    });
+    //  Observations helper
+    const byCode    = smart.byCodes(observations, 'code');
 
-    return quantity(match);
+    const heightObs = firstOf(byCode('8302-2'));
+    const bpPanel   = byCode('55284-4');
+    const hdlObs    = firstOf(byCode('2085-9'));
+    const ldlObs    = firstOf(byCode('2089-1'));
+
+    //  Blood-pressure components
+    const systolic  = pickBP(bpPanel, '8480-6');
+    const diastolic = pickBP(bpPanel, '8462-4');
+
+    return {
+      fname:       given,
+      lname:       family,
+      gender:      patient.gender  || '',
+      birthdate:   patient.birthDate || '',
+      height:      quantity(heightObs),
+      systolicbp:  systolic,
+      diastolicbp: diastolic,
+      hdl:         quantity(hdlObs),
+      ldl:         quantity(ldlObs)
+    };
   }
 
-  function quantity(observation) {
-    const q = observation?.valueQuantity;
+  // ──────────────────────────────────────────────────────────────
+  //  QUANTITY & BP HELPERS
+  // ──────────────────────────────────────────────────────────────
+  function quantity(obs) {
+    const q = obs?.valueQuantity;
     return (q && q.value !== undefined && q.unit)
       ? `${q.value} ${q.unit}`
       : undefined;
   }
 
-  // ────────────────────────────────────────────────────────────────────
-  //  DRAW
-  // ────────────────────────────────────────────────────────────────────
+  function pickBP(panelArr, loinc) {
+    if (!Array.isArray(panelArr) || !panelArr.length) return undefined;
+
+    const match = panelArr.find(obs =>
+      (obs.component || []).some(comp =>
+        (comp.code?.coding || []).some(cd => cd.code === loinc)
+      )
+    );
+
+    if (!match) return undefined;
+
+    // move the matched component’s value into valueQuantity so `quantity()` can read it
+    const comp = match.component.find(c =>
+      (c.code.coding || []).some(cd => cd.code === loinc)
+    );
+    match.valueQuantity = comp.valueQuantity;
+    return quantity(match);
+  }
+
+  const firstOf = arr => (Array.isArray(arr) && arr.length ? arr[0] : undefined);
+
+  // ──────────────────────────────────────────────────────────────
+  //  DRAW FUNCTION  – called from index.html after extractData()
+  // ──────────────────────────────────────────────────────────────
   window.drawVisualization = function (p) {
-    $('#holder').show();
     $('#loading').hide();
+    $('#holder').show();
+
     $('#fname').text(p.fname);
     $('#lname').text(p.lname);
     $('#gender').text(p.gender);
@@ -122,7 +126,7 @@
     $('#height').text(p.height);
     $('#systolicbp').text(p.systolicbp);
     $('#diastolicbp').text(p.diastolicbp);
-    $('#ldl').text(p.ldl);
     $('#hdl').text(p.hdl);
+    $('#ldl').text(p.ldl);
   };
 })(window);
