@@ -1,4 +1,5 @@
 /* global FHIR, $, window */
+console.log('reached new changes');
 (function (window) {
   // ──────────────────────────────────────────────────────────────
   //  MAIN ENTRY – returns a Promise resolved with a patient “view-model”
