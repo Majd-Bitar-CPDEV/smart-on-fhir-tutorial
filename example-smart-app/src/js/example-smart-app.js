@@ -1,131 +1,128 @@
-(function(window){
-  window.extractData = function() {
-    var ret = $.Deferred();
+/* global FHIR, $, window */
+(function (window) {
+  /**
+   *  MAIN ENTRY ────────────────
+   *  Returns a jQuery-style promise that resolves with a
+   *  “patient summary” object ready for drawVisualization().
+   */
+  window.extractData = function () {
+    const dfd = $.Deferred();
 
     function onError() {
-      console.log('Loading error', arguments);
-      ret.reject();
+      console.error('Loading error', arguments);
+      dfd.reject();
     }
 
-    function onReady(smart)  {
-      if (smart.hasOwnProperty('patient')) {
-        var patient = smart.patient;
-        var pt = patient.read();
-        var obv = smart.patient.api.fetchAll({
-                    type: 'Observation',
-                    query: {
-                      code: {
-                        $or: ['http://loinc.org|8302-2', 'http://loinc.org|8462-4',
-                              'http://loinc.org|8480-6', 'http://loinc.org|2085-9',
-                              'http://loinc.org|2089-1', 'http://loinc.org|55284-4']
-                      }
-                    }
-                  });
-
-        $.when(pt, obv).fail(onError);
-
-        $.when(pt, obv).done(function(patient, obv) {
-          var byCodes = smart.byCodes(obv, 'code');
-          var gender = patient.gender;
-
-          var fname = '';
-          var lname = '';
-
-          if (typeof patient.name[0] !== 'undefined') {
-            fname = patient.name[0];
-            lname = patient.name[0];
-          }
-
-          var height = byCodes('8302-2');
-          var systolicbp = getBloodPressureValue(byCodes('55284-4'),'8480-6');
-          var diastolicbp = getBloodPressureValue(byCodes('55284-4'),'8462-4');
-          var hdl = byCodes('2085-9');
-          var ldl = byCodes('2089-1');
-
-          var p = defaultPatient();
-          p.birthdate = patient.birthDate;
-          p.gender = gender;
-          p.fname = fname;
-          p.lname = lname;
-          p.height = getQuantityValueAndUnit(height[0]);
-
-          if (typeof systolicbp != 'undefined')  {
-            p.systolicbp = systolicbp;
-          }
-
-          if (typeof diastolicbp != 'undefined') {
-            p.diastolicbp = diastolicbp;
-          }
-
-          p.hdl = getQuantityValueAndUnit(hdl[0]);
-          p.ldl = getQuantityValueAndUnit(ldl[0]);
-
-          ret.resolve(p);
-        });
-      } else {
-        onError();
+    function onReady(smart) {
+      if (!smart.patient) {
+        return onError();
       }
+
+      // ── 1) fetch Patient + Observations in parallel ─────────────
+      const ptPromise  = smart.patient.read();
+      const obsPromise = smart.patient.api.fetchAll({
+        type: 'Observation',
+        query: {
+          code: {
+            $or: [
+              'http://loinc.org|8302-2', // Height
+              'http://loinc.org|8462-4', // Diastolic BP
+              'http://loinc.org|8480-6', // Systolic BP
+              'http://loinc.org|2085-9', // HDL
+              'http://loinc.org|2089-1', // LDL
+              'http://loinc.org|55284-4' // BP panel
+            ]
+          }
+        }
+      });
+
+      $.when(ptPromise, obsPromise).fail(onError);
+
+      $.when(ptPromise, obsPromise).done(function (patient, observations) {
+        //------------------------------------------------------------------
+        // 2)  DEMOGRAPHICS
+        //------------------------------------------------------------------
+        const nameObj = (patient.name && patient.name.length) ? patient.name[0] : {};
+        const given   = Array.isArray(nameObj.given)  ? nameObj.given.join(' ')   : (nameObj.given   || '');
+        const family  = Array.isArray(nameObj.family) ? nameObj.family.join(' ')  : (nameObj.family  || '');
+
+        //------------------------------------------------------------------
+        // 3)  CLINICAL OBSERVATIONS
+        //------------------------------------------------------------------
+        const byCode      = smart.byCodes(observations, 'code');
+        const heightObs   = byCode('8302-2');
+        const bpPanel     = byCode('55284-4');
+        const systolicBP  = pickBP(bpPanel, '8480-6');
+        const diastolicBP = pickBP(bpPanel, '8462-4');
+        const hdlObs      = byCode('2085-9');
+        const ldlObs      = byCode('2089-1');
+
+        //------------------------------------------------------------------
+        // 4)  BUILD SUMMARY OBJECT
+        //------------------------------------------------------------------
+        const summary = {
+          fname:       given,
+          lname:       family,
+          gender:      patient.gender || '',
+          birthdate:   patient.birthDate || '',
+          height:      quantity(heightObs[0]),
+          systolicbp:  systolicBP,
+          diastolicbp: diastolicBP,
+          hdl:         quantity(hdlObs[0]),
+          ldl:         quantity(ldlObs[0])
+        };
+
+        dfd.resolve(summary);
+      });
     }
 
     FHIR.oauth2.ready(onReady, onError);
-    return ret.promise();
-
+    return dfd.promise();
   };
 
-  function defaultPatient(){
-    return {
-      fname: {value: ''},
-      lname: {value: ''},
-      gender: {value: ''},
-      birthdate: {value: ''},
-      height: {value: ''},
-      systolicbp: {value: ''},
-      diastolicbp: {value: ''},
-      ldl: {value: ''},
-      hdl: {value: ''},
-    };
-  }
+  // ────────────────────────────────────────────────────────────────────
+  //  HELPERS
+  // ────────────────────────────────────────────────────────────────────
+  function pickBP(panel, loincCode) {
+    if (!panel || !panel.length) return undefined;
 
-  function getBloodPressureValue(BPObservations, typeOfPressure) {
-    var formattedBPObservations = [];
-    BPObservations.forEach(function(observation){
-      var BP = observation.component.find(function(component){
-        return component.code.coding.find(function(coding) {
-          return coding.code == typeOfPressure;
-        });
-      });
-      if (BP) {
-        observation.valueQuantity = BP.valueQuantity;
-        formattedBPObservations.push(observation);
+    // Find the component that matches the desired systolic/diastolic code
+    const match = panel.find(obs => {
+      const comp = (obs.component || []).find(c =>
+        (c.code?.coding || []).some(cd => cd.code === loincCode)
+      );
+      if (comp) {
+        // mutate so quantity() can reuse the same util
+        obs.valueQuantity = comp.valueQuantity;
+        return true;
       }
+      return false;
     });
 
-    return getQuantityValueAndUnit(formattedBPObservations[0]);
+    return quantity(match);
   }
 
-  function getQuantityValueAndUnit(ob) {
-    if (typeof ob != 'undefined' &&
-        typeof ob.valueQuantity != 'undefined' &&
-        typeof ob.valueQuantity.value != 'undefined' &&
-        typeof ob.valueQuantity.unit != 'undefined') {
-          return ob.valueQuantity.value + ' ' + ob.valueQuantity.unit;
-    } else {
-      return undefined;
-    }
+  function quantity(observation) {
+    const q = observation?.valueQuantity;
+    return (q && q.value !== undefined && q.unit)
+      ? `${q.value} ${q.unit}`
+      : undefined;
   }
 
-  window.drawVisualization = function(p) {
+  // ────────────────────────────────────────────────────────────────────
+  //  DRAW
+  // ────────────────────────────────────────────────────────────────────
+  window.drawVisualization = function (p) {
     $('#holder').show();
     $('#loading').hide();
-    $('#fname').html(p.fname);
-    $('#lname').html(p.lname);
-    $('#gender').html(p.gender);
-    $('#birthdate').html(p.birthdate);
-    $('#height').html(p.height);
-    $('#systolicbp').html(p.systolicbp);
-    $('#diastolicbp').html(p.diastolicbp);
-    $('#ldl').html(p.ldl);
-    $('#hdl').html(p.hdl);
+    $('#fname').text(p.fname);
+    $('#lname').text(p.lname);
+    $('#gender').text(p.gender);
+    $('#birthdate').text(p.birthdate);
+    $('#height').text(p.height);
+    $('#systolicbp').text(p.systolicbp);
+    $('#diastolicbp').text(p.diastolicbp);
+    $('#ldl').text(p.ldl);
+    $('#hdl').text(p.hdl);
   };
-
 })(window);
